@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI pipeline for the component project itself.
+#
+# Stages:
+#   validate    — lint commits (MRs) + confirm component YAML is well-formed
+#   build-image — build & push the sbom-processor image to this project's registry
+#   release     — create a GitLab Release to publish the component to the catalog
+#
+# Image versioning is coupled to the component version: both use the same git
+# tag (e.g. v1.2.3). This avoids a compatibility matrix between the two.
+# Consumers can still override `processor_version` to pin a different tag.
+#
+# Release workflow:
+#   1. Merge MRs with Conventional Commit messages (enforced by lint-commits).
+#   2. Run locally: git cliff --bump -o CHANGELOG.md
+#   3. Commit: VERSION=$(git cliff --bumped-version)
+#             git commit -am "chore: release $VERSION" && git tag $VERSION
+#   4. Push:   git push origin main --follow-tags
+#   CI then builds the image, extracts the release notes, and publishes the
+#   component to the GitLab CI Catalog automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+
+stages:
+  - validate
+  - build-image
+  - release
+
+variables:
+  SBOM_PROCESSOR_IMAGE: $CI_REGISTRY_IMAGE/sbom-processor
+
+# ── Validate ──────────────────────────────────────────────────────────────────
+
+lint-commits:
+  stage: validate
+  image: node:20-slim
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - npm install --save-dev @commitlint/cli @commitlint/config-conventional
+    - npx commitlint
+        --from "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+        --to HEAD
+        --verbose
+
+validate-component:
+  stage: validate
+  image: python:3.12-slim
+  script:
+    - pip install --quiet pyyaml
+    - |
+      python - <<'EOF'
+      import yaml, pathlib
+
+      for path in pathlib.Path("templates").glob("*.yml"):
+          raw = path.read_text()
+          parts = raw.split("\n---\n", 1)
+          doc = yaml.safe_load(parts[0])
+          assert "spec" in doc, f"{path}: missing top-level 'spec' key"
+          print(f"OK  {path}")
+      EOF
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ── Build sbom-processor image ────────────────────────────────────────────────
+
+build-sbom-processor:
+  stage: build-image
+  image: docker:26
+  services:
+    - docker:26-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build --pull --tag "$SBOM_PROCESSOR_IMAGE:$CI_COMMIT_SHORT_SHA" ./sbom-processor
+    - docker push "$SBOM_PROCESSOR_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        docker tag "$SBOM_PROCESSOR_IMAGE:$CI_COMMIT_SHORT_SHA" "$SBOM_PROCESSOR_IMAGE:latest"
+        docker push "$SBOM_PROCESSOR_IMAGE:latest"
+      fi
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag "$SBOM_PROCESSOR_IMAGE:$CI_COMMIT_SHORT_SHA" "$SBOM_PROCESSOR_IMAGE:$CI_COMMIT_TAG"
+        docker push "$SBOM_PROCESSOR_IMAGE:$CI_COMMIT_TAG"
+      fi
+  rules:
+    - changes:
+        - sbom-processor/**/*
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+
+# ── Release ───────────────────────────────────────────────────────────────────
+
+release-component:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs: [build-sbom-processor]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+  script:
+    - |
+      VERSION="${CI_COMMIT_TAG#v}"
+      awk "/^## \[$VERSION\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md \
+        > release_notes.md
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: './release_notes.md'
+    ref: $CI_COMMIT_TAG

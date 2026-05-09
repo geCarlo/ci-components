@@ -1,0 +1,98 @@
+spec:
+  inputs:
+    name:
+      description: "Unique identifier for this inclusion — prefixes all job names to avoid conflicts when included multiple times"
+      type: string
+    image:
+      description: "Container image to scan, e.g. registry.gitlab.com/namespace/project:tag"
+      type: string
+    trivy_version:
+      description: "Trivy image version"
+      default: "latest"
+      type: string
+    severity:
+      description: "Comma-separated Trivy severity levels to include"
+      default: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+      type: string
+    processor_version:
+      description: "Version tag of your CSV processor image"
+      default: "latest"
+      type: string
+
+---
+
+# Job 1 — public image: scans the target image and produces a CycloneDX SBOM
+$[[ inputs.name ]]-sbom-scan:
+  stage: sbom
+  image: aquasec/trivy:$[[ inputs.trivy_version ]]
+  variables:
+    SCAN_NAME: $[[ inputs.name ]]
+    SCAN_IMAGE: $[[ inputs.image ]]
+    SCAN_SEVERITY: $[[ inputs.severity ]]
+  script:
+    - trivy image
+        --format cyclonedx
+        --output "${SCAN_NAME}-sbom.cdx.json"
+        --severity "$SCAN_SEVERITY"
+        "$SCAN_IMAGE"
+  artifacts:
+    paths:
+      - "${SCAN_NAME}-sbom.cdx.json"
+    expire_in: 1 hour
+
+# Job 2 — public image: converts the CycloneDX SBOM to CSV
+$[[ inputs.name ]]-sbom-to-csv:
+  stage: sbom
+  needs:
+    - job: $[[ inputs.name ]]-sbom-scan
+      artifacts: true
+  image: python:3.12-slim
+  variables:
+    SCAN_NAME: $[[ inputs.name ]]
+  script:
+    - |
+      python3 - <<'EOF'
+      import json, csv, os
+
+      name = os.environ["SCAN_NAME"]
+
+      with open(f"{name}-sbom.cdx.json") as f:
+          sbom = json.load(f)
+
+      components = sbom.get("components", [])
+
+      with open(f"{name}-components.csv", "w", newline="") as f:
+          writer = csv.DictWriter(f, fieldnames=["name", "version", "type", "purl", "licenses"])
+          writer.writeheader()
+          for c in components:
+              licenses = ", ".join(
+                  lic.get("license", {}).get("id", "")
+                  for lic in c.get("licenses", [])
+              )
+              writer.writerow({
+                  "name":     c.get("name", ""),
+                  "version":  c.get("version", ""),
+                  "type":     c.get("type", ""),
+                  "purl":     c.get("purl", ""),
+                  "licenses": licenses,
+              })
+
+      print(f"Wrote {len(components)} components to {name}-components.csv")
+      EOF
+  artifacts:
+    paths:
+      - "${SCAN_NAME}-components.csv"
+    expire_in: 1 hour
+
+# Job 3 — your own image: processes the CSV
+# Replace <namespace>/<project> with your actual GitLab path.
+$[[ inputs.name ]]-process-csv:
+  stage: sbom
+  needs:
+    - job: $[[ inputs.name ]]-sbom-to-csv
+      artifacts: true
+  image: registry.gitlab.com/<namespace>/<project>/sbom-processor:$[[ inputs.processor_version ]]
+  variables:
+    SCAN_NAME: $[[ inputs.name ]]
+  script:
+    - process.sh "${SCAN_NAME}-components.csv"
